@@ -2,3 +2,6 @@
 .Rhistory
 .RData
 .Ruserdata
+datasus/
+metastore_db/
+*.log
