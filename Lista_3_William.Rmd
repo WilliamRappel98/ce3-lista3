@@ -63,12 +63,12 @@ always_allow_html: true
 \item \textbf{Escreva seu código com esmero, evitando operações redundantes, visando eficiência computacional, otimizando o uso de memória, comentando os resultados e usando as melhores práticas em programação.}
 \end{enumerate}
 
-```{r setup, results=FALSE, message=FALSE, echo=FALSE, warnings=FALSE}
-knitr::opts_chunk$set(echo=T, warnings=F)
+```{r setup, results=FALSE, message=FALSE, echo=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo=T, warning=F)
 
 # carrega os pacotes
 if (!require('pacman')) install.packages('pacman')
-pacman::p_load(stringr, tidyr, purrr, sparklyr, microbenchmark)
+pacman::p_load(stringr, tidyr, purrr, dplyr, sparklyr, microbenchmark, dbplot)
 ```
 
 \newpage
@@ -214,7 +214,8 @@ filter_csv <- function(csv_file) {
   csv_filtered <- str_replace_all(csv_file, '[/]csv[/]', '/csv-spark/')
   if (!file.exists(csv_filtered)) {
     data <- read.csv(csv_file)
-    data <- data[, cols_keep]
+    data <- data[, cols_keep] %>%
+      mutate_all(as.character)
     write.csv(data, csv_filtered)
   }
 }
@@ -235,7 +236,8 @@ filter_parquet <- function(parquet_file) {
   parquet_filtered <- str_replace_all(parquet_file, '[/]parquet[/]', '/parquet-spark/')
   if (!file.exists(parquet_filtered)) {
     data <- read_parquet(parquet_file)
-    data <- data[, cols_keep]
+    data <- data[, cols_keep] %>%
+      mutate_all(as.character)
     write_parquet(data, parquet_filtered)
   }
 }
@@ -249,9 +251,8 @@ Em seguida, vamos criar a conexão `Spark`.
 ```{r spark-connect}
 # conexao ao spark
 conf <- spark_config()
-conf$`sparklyr.cores.local` <- 3
-conf$`sparklyr.shell.driver-memory` <- '8G'
-conf$spark.memory.fraction <- 0.9
+conf$`sparklyr.cores.local` <- 4
+conf$`sparklyr.shell.driver-memory` <- '12G'
 sc <- spark_connect(master='local', config=conf)
 ```
 
@@ -282,13 +283,13 @@ microbenchmark_parquet <- function() {
 microbenchmark(
   csv = microbenchmark_csv(),
   parquet = microbenchmark_parquet(),
-  times = 3
+  times = 5
 )
 ```
 
-Pelo tempo mediano de execução, ao utilizar arquivos *.parquet* tivemos um aumento de 10x na velocidade de envio dos dados ao `Spark`.
+Pelo tempo mediano de execução, ao utilizar arquivos *.parquet* tivemos um aumento de mais de 10x na velocidade de envio dos dados ao `Spark`.
 
-Para realizar a questão 2, precisamos que os dados referentes a todos os estados e anos estejam no `Spark`. Para isso, vamos realizar procedimento semelhante ao feito anteriormente, porém agora com todos os 27 estados/distritos.
+Para realizar a questão 2, precisamos que os dados referentes a todos os estados e anos estejam no `Spark`. Para isso, vamos realizar procedimento semelhante ao feito anteriormente, porém agora com todos os 27 estados (ou distrito).
 
 ```{r send-parquet-spark}
 # cria subpasta datasus/parquet-spark-full
@@ -300,12 +301,14 @@ parquet_files <- list.files(parquet, full.names=T)
 
 # funcao para ler, filtrar colunas e exportar
 filter_parquet_full <- function(parquet_file) {
-  parquet_filtered <- str_replace_all(parquet_file, '[/]parquet[/]', '/parquet-spark-full/')
+  parquet_filtered <- str_replace_all(parquet_file, '[/]parquet[/]',
+                                      '/parquet-spark-full/')
   if (!file.exists(parquet_filtered)) {
     data <- read_parquet(parquet_file)
     data <- data[, cols_keep]
     data$UF <- str_extract(parquet_file, '[A-Z]{2}')
     data$ANO <- str_extract(parquet_file, '[0-9]{4}')
+    data <- data %>% mutate_all(as.character)
     write_parquet(data, parquet_filtered)
   }
 }
@@ -314,11 +317,10 @@ filter_parquet_full <- function(parquet_file) {
 walk(.x=parquet_files, .f=filter_parquet_full)
 
 # envio ao spark
-spark_read_parquet(
+tab_tbl <- spark_read_parquet(
   sc=sc,
   name='tab_full',
-  path=parquet_spark_full,
-  memory=F
+  path=parquet_spark_full
 )
 ```
 
@@ -326,36 +328,491 @@ spark_read_parquet(
 
 **Atenção**: **Elabore seus comandos dando preferência as funcionalidades do pacote sparklyr**.
 
-**a)** Faça uma breve análise exploratória dos dados (tabelas e gráficos) com base somente nas colunas existente nos arquivos de 1996. O dicionário das variaveis encontra-se no mesmo site do item a), na parte de documentação. Corrija eventuais erros encontrados; por exemplo, na variavel sexo são apresentados rótulos distintos para um mesmo significado.
+**a)** Faça uma breve análise exploratória dos dados (tabelas e gráficos) com base somente nas colunas existente nos arquivos de 1996. O dicionário das variaveis encontra-se no mesmo site do item a), na parte de documentação. Corrija eventuais erros encontrados; por exemplo, na variável sexo são apresentados rótulos distintos para um mesmo significado.
 
 \textcolor{red}{\bf Solução}
 
+Verificamos a dimensão da tabela.
 
-**b)** Ultilizando as funções do **sparklyr**, preencha os dados faltantes na idade da mãe com base na mediana. Se necessário, faça imputação de dados também nas demais váriaveis.
+```{r tab-dim}
+# dimensao da tabela
+sdf_dim(tab_tbl)
+```
 
-<!-- \textcolor{red}{\bf Solução} -->
+Ou seja, a tabela apresenta 74 milhões de registros, com 21 colunas.
 
-**c)** Novamente, ultilizando as funções do **sparklyr**, normalize (retire a média e divida pelo desvio padrão) as variáveis quantitativas do banco.
+As colunas `IDADEMAE`, `QTDFILVIVO`, `QTDFILMORT` e `PESO` são variáveis quantitativas.
 
-<!-- \textcolor{red}{\bf Solução} -->
+```{r quantitative-exploratory}
+# vetor com as variaveis quantiativas
+num_cols <- c('IDADEMAE', 'QTDFILVIVO', 'QTDFILMORT', 'PESO')
 
-**d)** Crie variáveis dummy (*one-hot-encoding*) que conjuntamente indiquem o dia da semana do nascimento (SEG, TER, ...). Em seguida, *binarize* o número de consultas pré-natais de modo que "0" represente "até 5 consultas" e "1" indique "6 ou mais consultas". (Ultilize as funções **ft_**)
+# summary dessas variaveis
+tab_tbl %>%
+  select(any_of(num_cols)) %>%
+  mutate_all(as.double) %>%
+  sdf_describe()
+```
 
-<!-- \textcolor{red}{\bf Solução} -->
+Vamos transformar para valor faltante aqueles valores que não fizerem sentido.
 
+```{r mutate-numeric}
+# transforma tipo e corrige valores incoerentes
+tab_tbl <- tab_tbl %>%
+  mutate_at(num_cols, as.double) %>%
+  mutate(IDADEMAE = na_if(IDADEMAE, 0),
+         IDADEMAE = na_if(IDADEMAE, 99),
+         QTDFILVIVO = na_if(QTDFILVIVO, 99),
+         QTDFILMORT = na_if(QTDFILMORT, 99),
+         PESO = na_if(PESO, 0),
+         PESO = na_if(PESO, 9999))
+```
 
+Agora, para a variávei `SEXO`.
 
-<!-- \textcolor{red}{\bf Solução} -->
+```{r sexo-table}
+# tabela
+tab_tbl %>%
+  group_by(SEXO) %>%
+  count()
+```
 
-**e)** Particione os dados aleatoriamente em bases de treinamento e teste. Ajuste, sobre a base de treinamento, um modelo de regressão logistica em que a variável resposta (*y*), indica se o parto foi ou não cesáreo. Analise o desempenho preditivo do modelo com base na matrix de confusão obtida no conjunto de teste. 
+Vamos corrigir a duplicação de codificações.
 
-<!-- \textcolor{red}{\bf Solução} -->
+```{r sexo-corrige}
+# corrige
+tab_tbl <- tab_tbl %>%
+  mutate(SEXO = case_when(SEXO == '0' ~ 'I',
+                          SEXO == '1' ~ 'M',
+                          SEXO == '2' ~ 'F',
+                          SEXO == '9' ~ 'I',
+                          TRUE ~ SEXO),
+         SEXO = na_if(SEXO, 'I'))
+```
 
+Agora, para a variávei `RACACOR`.
 
+```{r racacor-table}
+# tabela
+tab_tbl %>%
+  group_by(RACACOR) %>%
+  count()
+```
 
+Vamos tratar a variável.
 
+```{r racacor-corrige}
+# tratamento
+tab_tbl <- tab_tbl %>%
+  mutate(RACACOR = case_when(RACACOR == '1' ~ 'BRANCA',
+                             RACACOR == '2' ~ 'PRETA',
+                             RACACOR == '3' ~ 'AMARELA',
+                             RACACOR == '4' ~ 'PARDA',
+                             RACACOR == '5' ~ 'INDIGENA',
+                             RACACOR == '9' ~ '0',
+                             TRUE ~ RACACOR),
+         RACACOR = na_if(RACACOR, '0'))
+```
 
+Agora, para a variávei `LOCNASC`.
 
-```{r}
+```{r locnasc-table}
+# tabela
+tab_tbl %>%
+  group_by(LOCNASC) %>%
+  count()
+```
+
+Vamos tratar a variável.
+
+```{r locnasc-corrige}
+# tratamento
+tab_tbl <- tab_tbl %>%
+  mutate(LOCNASC = case_when(LOCNASC == '1' ~ 'HOSPITAL',
+                             LOCNASC == '2' ~ 'OUTRO ESTAB SAUDE',
+                             LOCNASC == '3' ~ 'DOMICILIO',
+                             LOCNASC == '4' ~ 'OUTROS',
+                             LOCNASC == '5' ~ 'IGNORADO',
+                             LOCNASC == '9' ~ 'IGNORADO',
+                             TRUE ~ LOCNASC),
+         LOCNASC = na_if(LOCNASC, 'IGNORADO'))
+```
+
+Agora, para a variávei `ESTCIVMAE`.
+
+```{r estcivmae-table}
+# tabela
+tab_tbl %>%
+  group_by(ESTCIVMAE) %>%
+  count()
+```
+
+Vamos tratar a variável.
+
+```{r estcivmae-corrige}
+# tratamento
+tab_tbl <- tab_tbl %>%
+  mutate(ESTCIVMAE = case_when(ESTCIVMAE == '1' ~ 'SOLTEIRA',
+                               ESTCIVMAE == '2' ~ 'CASADA',
+                               ESTCIVMAE == '3' ~ 'VIUVA',
+                               ESTCIVMAE == '4' ~ 'SEPARADAouDIVORCIADA',
+                               ESTCIVMAE == '5' ~ 'IGNORADO',
+                               ESTCIVMAE == '9' ~ 'IGNORADO',
+                               TRUE ~ ESTCIVMAE),
+         ESTCIVMAE = na_if(ESTCIVMAE, 'IGNORADO'))
+```
+
+Agora, para a variávei `ESCMAE`.
+
+```{r escmae-table}
+# tabela
+tab_tbl %>%
+  group_by(ESCMAE) %>%
+  count()
+```
+
+Vamos tratar a variável.
+
+```{r escmae-corrige}
+# tratamento
+tab_tbl <- tab_tbl %>%
+  mutate(ESCMAE = case_when(ESCMAE == '1' ~ 'NENHUMA',
+                            ESCMAE == '2' ~ '1a3anos',
+                            ESCMAE == '3' ~ '4a7anos',
+                            ESCMAE == '4' ~ '8a11anos',
+                            ESCMAE == '5' ~ '12mais',
+                            ESCMAE == '6' ~ 'IGNORADO',
+                            ESCMAE == '7' ~ 'IGNORADO',
+                            ESCMAE == '8' ~ 'IGNORADO',
+                            ESCMAE == '9' ~ 'IGNORADO',
+                            ESCMAE == '0' ~ 'IGNORADO',
+                            TRUE ~ ESCMAE),
+         ESCMAE = na_if(ESCMAE, 'IGNORADO'))
+```
+
+Agora, para a variávei `GESTACAO`.
+
+```{r gestacao-table}
+# tabela
+tab_tbl %>%
+  group_by(GESTACAO) %>%
+  count()
+```
+
+Vamos tratar a variável.
+
+```{r gestacao-corrige}
+# tratamento
+tab_tbl <- tab_tbl %>%
+  mutate(GESTACAO = case_when(GESTACAO == '1' ~ 'MENOSde22semanas',
+                              GESTACAO == '2' ~ '22a27semanas',
+                              GESTACAO == '3' ~ '28a31semanas',
+                              GESTACAO == '4' ~ '32a36semanas',
+                              GESTACAO == '5' ~ '37a41semanas',
+                              GESTACAO == '6' ~ '42mais',
+                              GESTACAO == '8' ~ 'IGNORADO',
+                              GESTACAO == '9' ~ 'IGNORADO',
+                              TRUE ~ GESTACAO),
+         GESTACAO = na_if(GESTACAO, 'IGNORADO'))
+```
+
+Agora, para a variávei `GRAVIDEZ`.
+
+```{r gravidez-table}
+# tabela
+tab_tbl %>%
+  group_by(GRAVIDEZ) %>%
+  count()
+```
+
+Vamos tratar a variável.
+
+```{r gravidez-corrige}
+# tratamento
+tab_tbl <- tab_tbl %>%
+  mutate(GRAVIDEZ = case_when(GRAVIDEZ == '1' ~ 'UNICA',
+                              GRAVIDEZ == '2' ~ 'DUPLA',
+                              GRAVIDEZ == '3' ~ 'TRIPLAouMAIS',
+                              GRAVIDEZ == '4' ~ 'IGNORADO',
+                              GRAVIDEZ == '9' ~ 'IGNORADO',
+                              TRUE ~ GRAVIDEZ),
+         GRAVIDEZ = na_if(GRAVIDEZ, 'IGNORADO'))
+```
+
+Agora, para a variávei `PARTO`.
+
+```{r parto-table}
+# tabela
+tab_tbl %>%
+  group_by(PARTO) %>%
+  count()
+```
+
+Vamos tratar a variável.
+
+```{r parto-corrige}
+# tratamento
+tab_tbl <- tab_tbl %>%
+  mutate(PARTO = case_when(PARTO == '1' ~ 'VAGINAL',
+                           PARTO == '2' ~ 'CESAREO',
+                           PARTO == '9' ~ 'IGNORADO',
+                           TRUE ~ PARTO),
+         PARTO = na_if(PARTO, 'IGNORADO'),
+         PARTO_CESAREO = case_when(PARTO == 'VAGINAL' ~ 0,
+                                   PARTO == 'CESAREO' ~ 1,
+                                   TRUE ~ NA)) %>%
+  mutate_at(c('PARTO_CESAREO'), as.double)
+```
+
+Agora, para a variávei `CONSULTAS`.
+
+```{r consultas-table}
+# tabela
+tab_tbl %>%
+  group_by(CONSULTAS) %>%
+  count()
+```
+
+Vamos tratar a variável.
+
+```{r consultas-corrige}
+# tratamento
+tab_tbl <- tab_tbl %>%
+  mutate(CONSULTAS = case_when(CONSULTAS == '1' ~ 'NENHUMA',
+                               CONSULTAS == '2' ~ '1a3',
+                               CONSULTAS == '3' ~ '4a6',
+                               CONSULTAS == '4' ~ '7mais',
+                               CONSULTAS == '8' ~ 'IGNORADO',
+                               CONSULTAS == '9' ~ 'IGNORADO',
+                               TRUE ~ CONSULTAS),
+         CONSULTAS = na_if(CONSULTAS, 'IGNORADO'),
+         CONSULTAS_int = case_when(CONSULTAS == 'NENHUMA' ~ 0,
+                                   CONSULTAS == '1a3' ~ 2,
+                                   CONSULTAS == '4a6' ~ 5,
+                                   CONSULTAS == '7mais' ~ 7)) %>%
+  mutate_at(c('CONSULTAS_int'), as.double)
+```
+
+Agora, criamos a variável com os dias da semana.
+
+```{r weekday}
+# cria variavel
+tab_tbl <- tab_tbl %>%
+  mutate(DTNASC = to_date(DTNASC, 'ddMMyyyy'),
+         WEEKDAY = date_format(DTNASC, 'E'),
+         WEEKDAY = as.character(WEEKDAY))
+
+# tabela
+tab_tbl %>%
+  group_by(WEEKDAY) %>%
+  count()
+```
+
+Em seguida, filtramos apenas os registros em que sabemos se o parto foi cesáreo ou não.
+
+```{r filter-target}
+# filtra pela target
+tab_tbl <- tab_tbl %>%
+  filter(!is.na(PARTO))
+```
+
+**b)** Utilizando as funções do **sparklyr**, preencha os dados faltantes na idade da mãe com base na mediana. Se necessário, faça imputação de dados também nas demais váriaveis.
+
+\textcolor{red}{\bf Solução}
+
+Para realizar os procedimentos sequenciais, vamos criar um objeto denominado `pipe`, que conterá o passo-a-passo das transformações a serem realizadas.
+
+```{r create-pipeline}
+# cria o pipeline
+pipe <- ml_pipeline(sc)
+```
+
+Primeiro, adicionamos a imputação da coluna `IDADEMAE`, que representa a idade da mãe.
+
+```{r missing-imput-idademae}
+# imputa pela mediana na variavel IDADEMAE
+pipe <- pipe %>%
+  ft_imputer(input_col='IDADEMAE',
+             output_col='IDADEMAE_imput',
+             strategy='median')
+```
+
+Em seguida, realizamos imputação com a mediana para as demais variáveis numéricas.
+
+```{r missing-imput-other-numeric}
+# imputa pela mediana nas demais variaveis quantitativas
+pipe <- pipe %>%
+  ft_imputer(input_col='QTDFILVIVO',
+             output_col='QTDFILVIVO_imput',
+             strategy='median') %>%
+  ft_imputer(input_col='QTDFILMORT',
+             output_col='QTDFILMORT_imput',
+             strategy='median') %>%
+  ft_imputer(input_col='PESO',
+             output_col='PESO_imput',
+             strategy='median')
+```
+
+Para as categóricas, vamos imputar a moda. Como esse processo não está parametrizado na função `ft_imputer`, vamos realizar manualmente, atuando diretamente na tabela original, por fora do `pipe`.
+
+```{r missing-imput-categorical}
+# vetor com as variaveis
+cat_cols <- c('SEXO', 'RACACOR', 'LOCNASC', 'ESTCIVMAE',
+              'ESCMAE', 'GESTACAO', 'GRAVIDEZ', 
+              'CONSULTAS', 'CONSULTAS_int', 'WEEKDAY')
+
+# imputa pela moda nas variaveis qualitativas
+for (col in cat_cols) {
+  imput_value <- tab_tbl %>%
+    group_by_at(col) %>%
+    count() %>%
+    arrange(desc(n)) %>%
+    head(1) %>%
+    select_at(col) %>%
+    collect() %>%
+    as.character()
+  tab_tbl <- tab_tbl %>%
+    mutate(across(col, coalesce, imput_value))
+}
+
+# corrige tipo da variavel CONSULTAS_int
+tab_tbl <- tab_tbl %>%
+  mutate_at(c('CONSULTAS_int'), as.double)
+```
+
+**c)** Novamente, utilizando as funções do **sparklyr**, normalize (retire a média e divida pelo desvio padrão) as variáveis quantitativas do banco.
+
+\textcolor{red}{\bf Solução}
+
+Agora, adicionamos ao `pipe` o procedimento de normalização das variáveis quantitativas.
+
+```{r scale-vars}
+# vetor com as variaveis quantitativas imputadas
+num_cols_imput <- paste0(num_cols, '_imput')
+
+# adicao da normalizacao ao pipe
+pipe <- pipe %>%
+  ft_vector_assembler(input_col=num_cols_imput,
+                      output_col='numeric') %>%
+  ft_standard_scaler(input_col='numeric',
+                     output_col='numeric_scaled',
+                     with_mean=T)
+```
+
+**d)** Crie variáveis dummy (*one-hot-encoding*) que conjuntamente indiquem o dia da semana do nascimento (SEG, TER, ...). Em seguida, *binarize* o número de consultas pré-natais de modo que "0" represente "até 5 consultas" e "1" indique "6 ou mais consultas". (Utilize as funções **ft_**)
+
+\textcolor{red}{\bf Solução}
+
+Primeiro, adicionamos ao `pipe` o procedimento de gerar as variáveis dummy do dia da semana.
+
+```{r one-hot-weekday}
+# aplica one hot enconding a WEEKDAY
+pipe <- pipe %>%
+  ft_string_indexer(input_col='WEEKDAY',
+                    output_col='WEEKDAY_idx') %>%
+  ft_one_hot_encoder(input_cols=c('WEEKDAY_idx'),
+                     output_cols=c('WEEKDAY_one_hot'),
+                     handle_invalid='keep')
+```
+
+Em seguida, fazemos a binarização da variável `CONSULTAS`, utilizando o valor 6 como corte (ao invés do sugerido de 5).
+
+```{r binarize-consultas}
+# aplica binarizacao a CONSULTAS_int
+pipe <- pipe %>%
+  ft_binarizer(input_col='CONSULTAS_int',
+               output_col='CONSULTAS_bin',
+               threshold=6)
+```
+
+Depois, realizamos o *one-hot-enconding* com as demais variáveis categóricas.
+
+```{r one-hot-others}
+# aplica one hot enconding as demais variaveis qualitativas
+pipe <- pipe %>%
+  ft_string_indexer(input_col='SEXO',
+                    output_col='SEXO_idx') %>%
+  ft_string_indexer(input_col='RACACOR',
+                    output_col='RACACOR_idx') %>%
+  ft_string_indexer(input_col='LOCNASC',
+                    output_col='LOCNASC_idx') %>%
+  ft_string_indexer(input_col='ESTCIVMAE',
+                    output_col='ESTCIVMAE_idx') %>%
+  ft_string_indexer(input_col='ESCMAE',
+                    output_col='ESCMAE_idx') %>%
+  ft_string_indexer(input_col='GESTACAO',
+                    output_col='GESTACAO_idx') %>%
+  ft_string_indexer(input_col='GRAVIDEZ',
+                    output_col='GRAVIDEZ_idx') %>%
+  ft_one_hot_encoder(input_cols=paste0(cat_cols[1:7], '_idx'),
+                     output_cols=paste0(cat_cols[1:7], '_one_hot'),
+                     handle_invalid='keep')
+```
+
+Por último, juntamos as colunas que serão utilizadas como variáveis explicativas.
+
+```{r assemble}
+# aplica o vector assemble
+pipe <- pipe %>%
+  ft_vector_assembler(input_col=c('numeric_scaled',
+                                  'WEEKDAY_one_hot', 
+                                  'CONSULTAS_bin',
+                                  paste0(cat_cols[1:7], '_one_hot')),
+                      output_col='model_features')
+```
+
+**e)** Particione os dados aleatoriamente em bases de treinamento e teste. Ajuste, sobre a base de treinamento, um modelo de regressão logistica em que a variável resposta (*y*), indica se o parto foi ou não cesáreo. Analise o desempenho preditivo do modelo com base na matriz de confusão obtida no conjunto de teste. 
+
+\textcolor{red}{\bf Solução}
+
+Primeiro, particionamos os dados, utilizando 70% para treinamento e 30% para teste.
+
+```{r split-data}
+# particionando o conjunto de dados em treino e teste
+partition <- tab_tbl %>%
+ sdf_random_split(training=.7, test=.3, seed=1281)
+
+# create table references
+data_train <- sdf_register(partition$train, 'train')
+data_test <- sdf_register(partition$test, 'test')
+
+# cache
+tbl_cache(sc, 'train')
+tbl_cache(sc, 'test')
+```
+
+Em seguida, adicionamos o modelo de regressão logística ao `pipe` e aplicamos a função para que o `pipe` seja executado.
+
+```{r fit-model}
+# adiciona modelo ao pipe
+pipe <- pipe %>%
+  ml_logistic_regression(label_col='PARTO_CESAREO',
+                         features_col='model_features')
+
+# checa se ja existe modelo treinado, para poupar retrabalho
+model <- 'modelo_treinado'
+if (file.exists(model)) {
+  trained_model <- ml_load(sc, model)
+} else {
+  trained_model <- ml_fit(pipe, tbl(sc, 'train'))
+  ml_save(trained_model, model)
+}
+```
+
+Utilizamos o modelo para realizar predições com o conjunto de teste. Em seguida, apresentamos a matriz de confusão.
+
+```{r predict-model}
+# calcula predicoes
+preds <- ml_transform(trained_model, tbl(sc, 'test'))
+
+# matriz de confusao
+preds %>%
+  count(PARTO_CESAREO, prediction) %>%
+  arrange(PARTO_CESAREO, prediction)
+```
+
+Ao avaliar a matriz de confusão, percebe-se que a acurácia geral foi de 68%. Dos casos em que o parto foi cesáreo, o modelo conseguiu identificar corretamente 62%. Já dos casos em que o parto foi vaginal, o percentual de acerto do modelo foi de 73%.
+
+```{r spark-disconnect, include=FALSE}
 spark_disconnect(sc)
 ```

@@ -5,3 +5,4 @@
 datasus/
 metastore_db/
 *.log
+modelo_treinado/
